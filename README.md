@@ -8,7 +8,8 @@ A cross-platform desktop application that extracts video sources from a playlist
 * Automatically extract all video pages using Selenium.
 * Parse video sources with BeautifulSoup.
 * Generate FFmpeg commands for each video.
-* Display progress while processing videos in the background.
+* Select individual videos with checkboxes and download any selection, or download the whole playlist.
+* Display per-download progress while processing videos in the background.
 * Copy generated commands or save them to a text file.
 
 ## Project Structure
@@ -28,6 +29,7 @@ project/
 * Python 3.10+
 * Google Chrome or another Chromium-based browser supported by Selenium
 * Selenium Manager (included with Selenium) to locate/download a compatible ChromeDriver
+* FFmpeg installed and available on `PATH` to download videos
 
 ## Installation
 
@@ -84,7 +86,7 @@ pip install -r requirements.txt
 python app.py
 ```
 
-Enter a playlist URL, start scraping, and use **Copy commands** or **Save to file** to export the results. The window remains responsive while Selenium processes the playlist.
+Enter a playlist URL and start scraping. In the **Videos** tab, use the checkboxes to select one or more videos, then click **Download selected videos** and choose a destination folder. Use **Download videos** to download the whole playlist. The progress bar updates during each download when FFprobe can determine the source duration; otherwise it indicates that the download is still in progress. The **FFmpeg commands** tab provides the generated commands for copying or saving. The window remains responsive while scraping and downloading.
 
 ## Build a desktop executable
 
@@ -104,7 +106,7 @@ The app bundle/executable is placed in `dist/`. Build separately on Windows, mac
 4. Visit each video page.
 5. Find the `<video>` element.
 6. Extract the `src` attribute.
-7. Generate an FFmpeg command for each video.
+7. Generate an FFmpeg command for each video and optionally run FFmpeg to download the video files to a chosen folder.
 
 Example output:
 
@@ -126,6 +128,7 @@ ffmpeg -i "https://example.com/video2.mp4" -c copy -bsf:a aac_adtstoasc 2.mp4;
 * The target website must allow access through Selenium.
 * Selenium opens the browser in headless mode.
 * The first Selenium run may need an internet connection so Selenium Manager can obtain a compatible driver.
+* FFmpeg is a separate executable and must be installed and available on `PATH` for in-app downloads. FFprobe (usually distributed with FFmpeg) enables per-video percentage progress; downloads still work without it.
 
 ## License
 

@@ -1,9 +1,10 @@
 import sys
 
-from PySide6.QtCore import QThread, QUrl, Signal
+from PySide6.QtCore import QThread, Qt, QUrl, Signal
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -13,11 +14,14 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from scraper import process_url
+from ffmpeg import build_ffmpeg_command, download_videos
+from scraper import process_video_details
 
 
 class ScrapeWorker(QThread):
@@ -31,20 +35,58 @@ class ScrapeWorker(QThread):
 
     def run(self) -> None:
         try:
-            results = process_url(self.url, progress_callback=self.progress.emit)
+            results = process_video_details(
+                self.url,
+                progress_callback=self.progress.emit,
+            )
         except Exception as error:
             self.failed.emit(str(error))
         else:
             self.completed.emit(results)
 
 
+class DownloadWorker(QThread):
+    progress = Signal(object, str)
+    completed = Signal(list)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        video_sources: list[str],
+        output_directory: str,
+        start_index: int = 1,
+        output_indices: list[int] | None = None,
+    ) -> None:
+        super().__init__()
+        self.video_sources = video_sources
+        self.output_directory = output_directory
+        self.start_index = start_index
+        self.output_indices = output_indices
+
+    def run(self) -> None:
+        try:
+            files = download_videos(
+                self.video_sources,
+                self.output_directory,
+                progress_callback=self.progress.emit,
+                start_index=self.start_index,
+                output_indices=self.output_indices,
+            )
+        except Exception as error:
+            self.failed.emit(str(error))
+        else:
+            self.completed.emit(files)
+
+
 class VideoScraperWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.worker: ScrapeWorker | None = None
+        self.worker: QThread | None = None
+        self.video_sources: list[str] = []
+        self.video_checkboxes: list[QCheckBox] = []
         self.setWindowTitle("Video Scraper")
-        self.setMinimumSize(720, 560)
-        self.resize(900, 680)
+        self.setMinimumSize(820, 680)
+        self.resize(1040, 780)
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -56,7 +98,7 @@ class VideoScraperWindow(QMainWindow):
         title = QLabel("Video Scraper")
         title.setObjectName("title")
         subtitle = QLabel(
-            "Extract video sources from a playlist and generate FFmpeg commands."
+            "Extract playlist videos, download them, or generate FFmpeg commands."
         )
         subtitle.setObjectName("subtitle")
 
@@ -77,20 +119,47 @@ class VideoScraperWindow(QMainWindow):
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(0)
-        self.progress_bar.setTextVisible(False)
-        self.progress_bar.setFixedHeight(8)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFormat("%p%")
+        self.progress_bar.setFixedHeight(18)
+        self.progress_bar.hide()
 
         self.status_label = QLabel("Ready")
         self.status_label.setObjectName("status")
+        self.status_label.hide()
 
-        results_label = QLabel("Generated commands")
-        results_label.setObjectName("sectionTitle")
+        self.select_all_checkbox = QCheckBox("Select all videos")
+        self.select_all_checkbox.setEnabled(False)
+        self.select_all_checkbox.stateChanged.connect(self.toggle_all_videos)
+
+        self.selection_count_label = QLabel("No videos loaded")
+        self.selection_count_label.setObjectName("status")
+
+        self.video_list = QWidget()
+        self.video_list_layout = QVBoxLayout(self.video_list)
+        self.video_list_layout.setContentsMargins(8, 8, 8, 8)
+        self.video_list_layout.setSpacing(4)
+        self.video_list_layout.addStretch(1)
+
+        video_scroll_area = QScrollArea()
+        video_scroll_area.setWidgetResizable(True)
+        video_scroll_area.setWidget(self.video_list)
+        video_scroll_area.setObjectName("videoList")
+        video_tab = QWidget()
+        video_tab_layout = QVBoxLayout(video_tab)
+        video_tab_layout.addWidget(self.select_all_checkbox)
+        video_tab_layout.addWidget(self.selection_count_label)
+        video_tab_layout.addWidget(video_scroll_area, 1)
+
         self.results = QPlainTextEdit()
         self.results.setReadOnly(True)
         self.results.setPlaceholderText(
             "Your FFmpeg commands will appear here after scraping."
         )
         self.results.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(video_tab, "Videos")
+        self.tabs.addTab(self.results, "FFmpeg commands")
 
         self.copy_button = QPushButton("Copy commands")
         self.copy_button.setEnabled(False)
@@ -100,13 +169,23 @@ class VideoScraperWindow(QMainWindow):
         self.save_button.setEnabled(False)
         self.save_button.clicked.connect(self.save_commands)
 
+        self.download_button = QPushButton("Download videos")
+        self.download_button.setEnabled(False)
+        self.download_button.clicked.connect(self.start_download)
+
+        self.source_download_button = QPushButton("Download selected videos")
+        self.source_download_button.setEnabled(False)
+        self.source_download_button.clicked.connect(self.start_selected_download)
+
         self.clear_button = QPushButton("Clear")
         self.clear_button.clicked.connect(self.clear)
 
         actions = QHBoxLayout()
+        actions.addWidget(self.source_download_button)
+        actions.addWidget(self.download_button)
+        actions.addStretch(1)
         actions.addWidget(self.copy_button)
         actions.addWidget(self.save_button)
-        actions.addStretch(1)
         actions.addWidget(self.clear_button)
 
         layout.addWidget(title)
@@ -115,8 +194,7 @@ class VideoScraperWindow(QMainWindow):
         layout.addLayout(input_row)
         layout.addWidget(self.progress_bar)
         layout.addWidget(self.status_label)
-        layout.addWidget(results_label)
-        layout.addWidget(self.results, 1)
+        layout.addWidget(self.tabs, 1)
         layout.addLayout(actions)
         self.setCentralWidget(root)
         self.setStyleSheet(
@@ -147,6 +225,36 @@ class VideoScraperWindow(QMainWindow):
             }
             QLineEdit:focus, QPlainTextEdit:focus {
                 border: 1px solid #315efb;
+            }
+            QScrollArea#videoList {
+                background: white;
+                border: 1px solid #d5dbea;
+                border-radius: 8px;
+            }
+            QTabWidget::pane {
+                background: white;
+                border: 1px solid #d5dbea;
+                border-radius: 8px;
+            }
+            QTabBar::tab {
+                background: #e9edf5;
+                border-top-left-radius: 6px;
+                border-top-right-radius: 6px;
+                padding: 8px 16px;
+                margin-right: 4px;
+            }
+            QTabBar::tab:selected {
+                background: white;
+                color: #315efb;
+                font-weight: 600;
+            }
+            QCheckBox {
+                spacing: 8px;
+                padding: 7px;
+            }
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
             }
             QPushButton {
                 background: white;
@@ -191,12 +299,22 @@ class VideoScraperWindow(QMainWindow):
             or parsed_url.scheme().lower() not in ("http", "https")
             or not parsed_url.host()
         ):
+            self.progress_bar.hide()
             self.status_label.setText("Enter a valid HTTP or HTTPS playlist URL.")
+            self.status_label.show()
             return
 
+        self.progress_bar.show()
+        self.status_label.show()
         self.results.clear()
+        self.video_sources.clear()
+        self.clear_video_list()
         self.copy_button.setEnabled(False)
         self.save_button.setEnabled(False)
+        self.download_button.setEnabled(False)
+        self.select_all_checkbox.setEnabled(False)
+        self.selection_count_label.setText("Loading videos…")
+        self.source_download_button.setEnabled(False)
         self.start_button.setEnabled(False)
         self.progress_bar.setRange(0, 0)
         self.status_label.setText("Loading playlist and processing videos…")
@@ -213,28 +331,177 @@ class VideoScraperWindow(QMainWindow):
         self.progress_bar.setValue(round(progress * 100))
         self.status_label.setText(f"Processing videos… {round(progress * 100)}%")
 
-    def show_results(self, commands: list[str]) -> None:
+    def show_results(
+        self,
+        video_details: list[tuple[str, str | None]],
+    ) -> None:
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(100)
-        if not commands:
+        if not video_details:
+            self.select_all_checkbox.setEnabled(False)
+            self.selection_count_label.setText("No videos loaded")
             self.status_label.setText(
                 "Scraping finished, but no video sources were found."
             )
             return
 
+        video_sources = [video_src for video_src, _ in video_details]
+        self.video_sources = video_sources
+        self.clear_video_list()
+        for index, (_, title) in enumerate(video_details, start=1):
+            label = f"{title} - {index}" if title else f"Video {index}"
+            checkbox = QCheckBox(label)
+            checkbox.setToolTip(video_sources[index - 1])
+            checkbox.stateChanged.connect(self.update_selection_state)
+            self.video_checkboxes.append(checkbox)
+            self.video_list_layout.insertWidget(
+                self.video_list_layout.count() - 1,
+                checkbox,
+            )
+        self.select_all_checkbox.setEnabled(bool(video_sources))
+        self.update_selection_state()
+        commands = [
+            build_ffmpeg_command(video_url, index)
+            for index, video_url in enumerate(video_sources, start=1)
+        ]
         self.results.setPlainText("\n".join(commands))
         self.copy_button.setEnabled(True)
         self.save_button.setEnabled(True)
+        self.download_button.setEnabled(True)
         self.status_label.setText(f"Done — generated {len(commands)} command(s).")
 
     def show_error(self, message: str) -> None:
-        self.progress_bar.setRange(0, 1)
-        self.progress_bar.setValue(0)
-        self.status_label.setText(f"Scraping failed: {message}")
+        self.progress_bar.hide()
+        self.status_label.show()
+        self.status_label.setText(f"Operation failed: {message}")
 
     def scraping_finished(self) -> None:
         self.start_button.setEnabled(True)
         self.worker = None
+
+    def start_download(self) -> None:
+        if not self.video_sources:
+            return
+
+        self._start_download(
+            self.video_sources,
+            list(range(1, len(self.video_sources) + 1)),
+        )
+
+    def start_selected_download(self) -> None:
+        selected_indices = [
+            index
+            for index, checkbox in enumerate(self.video_checkboxes)
+            if checkbox.isChecked()
+        ]
+        if not selected_indices:
+            return
+
+        self._start_download(
+            [self.video_sources[index] for index in selected_indices],
+            [index + 1 for index in selected_indices],
+        )
+
+    def _start_download(
+        self,
+        video_sources: list[str],
+        output_indices: list[int],
+    ) -> None:
+        output_directory = QFileDialog.getExistingDirectory(
+            self,
+            "Choose download folder",
+        )
+        if not output_directory:
+            return
+
+        self.start_button.setEnabled(False)
+        self.download_button.setEnabled(False)
+        self.select_all_checkbox.setEnabled(False)
+        for checkbox in self.video_checkboxes:
+            checkbox.setEnabled(False)
+        self.source_download_button.setEnabled(False)
+        self.clear_button.setEnabled(False)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.status_label.setText("Preparing downloads…")
+
+        self.worker = DownloadWorker(
+            video_sources,
+            output_directory,
+            output_indices=output_indices,
+        )
+        self.worker.progress.connect(self.download_progress)
+        self.worker.completed.connect(self.download_completed)
+        self.worker.failed.connect(self.show_error)
+        self.worker.finished.connect(self.download_finished)
+        self.worker.start()
+
+    def download_progress(self, progress: float | None, message: str) -> None:
+        if progress is None:
+            self.progress_bar.setRange(0, 0)
+        else:
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(round(progress * 100))
+        self.status_label.setText(message)
+
+    def download_completed(self, files: list[str]) -> None:
+        self.progress_bar.setValue(100)
+        count = len(files)
+        video_label = "video" if count == 1 else "videos"
+        self.status_label.setText(f"Downloaded {count} {video_label}.")
+
+    def download_finished(self) -> None:
+        self.start_button.setEnabled(True)
+        self.download_button.setEnabled(bool(self.video_sources))
+        self.select_all_checkbox.setEnabled(bool(self.video_sources))
+        for checkbox in self.video_checkboxes:
+            checkbox.setEnabled(True)
+        self.update_selection_state()
+        self.clear_button.setEnabled(True)
+        self.worker = None
+
+    def toggle_all_videos(self, state: int) -> None:
+        if state == Qt.CheckState.PartiallyChecked.value:
+            return
+
+        checked = state == Qt.CheckState.Checked.value
+        for checkbox in self.video_checkboxes:
+            checkbox.setChecked(checked)
+        self.update_selection_state()
+
+    def update_selection_state(self, _state: int | None = None) -> None:
+        selected_count = sum(
+            checkbox.isChecked() for checkbox in self.video_checkboxes
+        )
+        total = len(self.video_checkboxes)
+        if selected_count == total and total:
+            check_state = Qt.CheckState.Checked
+        elif selected_count:
+            check_state = Qt.CheckState.PartiallyChecked
+        else:
+            check_state = Qt.CheckState.Unchecked
+
+        self.select_all_checkbox.blockSignals(True)
+        self.select_all_checkbox.setCheckState(check_state)
+        self.select_all_checkbox.blockSignals(False)
+        self.selection_count_label.setText(
+            f"{selected_count} of {total} selected"
+            if total
+            else "No videos loaded"
+        )
+        self.source_download_button.setEnabled(selected_count > 0)
+
+    def clear_video_list(self) -> None:
+        self.video_checkboxes.clear()
+        while self.video_list_layout.count():
+            item = self.video_list_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self.video_list_layout.addStretch(1)
+        self.select_all_checkbox.blockSignals(True)
+        self.select_all_checkbox.setCheckState(Qt.CheckState.Unchecked)
+        self.select_all_checkbox.blockSignals(False)
 
     def copy_commands(self) -> None:
         commands = self.results.toPlainText()
@@ -269,18 +536,27 @@ class VideoScraperWindow(QMainWindow):
             return
         self.url_input.clear()
         self.results.clear()
+        self.video_sources.clear()
+        self.clear_video_list()
+        self.select_all_checkbox.setCheckState(Qt.CheckState.Unchecked)
+        self.select_all_checkbox.setEnabled(False)
+        self.selection_count_label.setText("No videos loaded")
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(0)
         self.status_label.setText("Ready")
+        self.progress_bar.hide()
+        self.status_label.hide()
         self.copy_button.setEnabled(False)
         self.save_button.setEnabled(False)
+        self.download_button.setEnabled(False)
+        self.source_download_button.setEnabled(False)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self.worker and self.worker.isRunning():
             QMessageBox.information(
                 self,
-                "Scraping in progress",
-                "Wait for the current scraping operation to finish before closing.",
+                "Operation in progress",
+                "Wait for the current operation to finish before closing.",
             )
             event.ignore()
             return
